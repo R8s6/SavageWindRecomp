@@ -17,15 +17,15 @@ typedef struct {
 
 // What the contexts are made for (a change makes them again)
 typedef struct {
-    uint32_t display_w, display_h;  // the game's final image (the interpolated frame's size)
+    uint32_t display_w, display_h;  // the interpolated frame's size, as the SDK sees it
     uint32_t render_w, render_h;    // the 3D scene's (depth and motion vectors)
     VkFormat color_format, hudless_format;
     bool depth_inverted;
 } FgConfig;
 
 typedef struct {
-    FgImage color;     // this frame as presented (with the HUD)
-    FgImage hudless;   // ... without it (the 3D scene composited, before the HUD's first draw)
+    FgImage color;     // the frame with the HUD, or the scene if the caller composites the HUD itself
+    FgImage hudless;   // the scene without HUD, if color includes the HUD
     FgImage depth;     // the 3D scene's depth (D32)
     FgImage motion;    // motion vectors (.xy: where each pixel was in the previous frame - here, times motion_scale)
     float motion_scale[2];  // .xy times this over the render size is that uv offset (0, 0: .xy are uv units)

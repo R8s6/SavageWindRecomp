@@ -10740,10 +10740,10 @@ static struct {
     uint64_t frame_id, last_ns;
 } fg;
 
-// Its own images (with storage use, which post_image's lack): 0 the HUD-less copy, 1 motion vectors, 2 the
-// interpolated frame
+enum { FG_HUDLESS, FG_MOTION, FG_INTERPOLATED, FG_SCALED_SCENE, FG_COMPOSITED, FG_IMAGES };
+
 static TexBackend *fg_image(int i, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage) {
-    static TexBackend img[3];
+    static TexBackend img[FG_IMAGES];
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h || d->format != f)) {
         vk_views_forget(d);
@@ -10773,21 +10773,26 @@ static VkFormat srgb_of(VkFormat f) {
     return f == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_SRGB : f == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_SRGB : f;
 }
 
+static void fg_blit(VkCommandBuffer cb, const TexBackend *src, const TexBackend *dst, VkFilter filter) {
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                      .srcOffsets = {{0, 0, 0}, {(int32_t)src->width, (int32_t)src->height, 1}},
+                      .dstOffsets = {{0, 0, 0}, {(int32_t)dst->width, (int32_t)dst->height, 1}}};
+    rec_CmdBlitImage(cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, filter);
+}
+
 static void fg_copy_hudless(void) {
     fg.copy_pending = false;
     TexBackend *s = fg.out_rt ? vk_tex(fg.out_rt, true) : NULL;
     if (!s || !s->image || s->aspect != VK_IMAGE_ASPECT_COLOR_BIT || s->layers != 1 || s->samples != 1) return;
     // (as the presented image has it: BOTW draws the HUD into a linear 10-bit image, then copies that sRGB-encoded into
     // the 8-bit one it presents; a blit into an sRGB image encodes the same way, and it is read through a UNORM view)
-    TexBackend *d = fg_image(0, s->width, s->height, srgb_of(fg.present_format ? fg.present_format : VK_FORMAT_R8G8B8A8_UNORM),
+    TexBackend *d = fg_image(FG_HUDLESS, s->width, s->height,
+                             srgb_of(fg.present_format ? fg.present_format : VK_FORMAT_R8G8B8A8_UNORM),
                              VK_IMAGE_USAGE_TRANSFER_DST_BIT);
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
-    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                      .srcOffsets = {{0, 0, 0}, {(int32_t)s->width, (int32_t)s->height, 1}},
-                      .dstOffsets = {{0, 0, 0}, {(int32_t)s->width, (int32_t)s->height, 1}}};
-    rec_CmdBlitImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
+    fg_blit(cb, s, d, VK_FILTER_NEAREST);
     vk_full_barrier(cb);
     fg.hudless_ok = true;
 }
@@ -10953,6 +10958,19 @@ static void fg_run(void *arg) {
     if (!fg_dispatch(j->cb, &j->cfg, &j->f)) atomic_store(&fg_failed, 1);
 }
 
+static bool fg_scene_resolution(const TexBackend *depth, const TexBackend *color) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("SAVAGEWIND_FG_SCENE_RES");
+        enabled = e && atoi(e) != 0;
+    }
+    // Optical flow needs six levels of downsampled luma. The HUD pass compares 8-bit sRGB colour.
+    VkFormat format = unorm_of(color->format);
+    return enabled && (format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM) &&
+           depth->width >= 64 && depth->height >= 64 && depth->width <= color->width && depth->height <= color->height &&
+           (depth->width < color->width || depth->height < color->height);
+}
+
 // At the game's present (device.c), outside the window image's rendering: the frame between the previous one and
 // t (b: its image), or NULL (not wanted, or this frame lacks what it needs: the next one starts over).
 TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
@@ -10996,7 +11014,7 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
         TexBackend *db = vk_tex(fg.cand[best].depth, true);
         vk_end_pass();
         VkCommandBuffer cb = vk_cmd();
-        TexBackend *mv = fg_image(1, db->width, db->height, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+        TexBackend *mv = fg_image(FG_MOTION, db->width, db->height, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
         gp_mark(cb, "frame generation: motion vectors");
         bool link = fg.cand[best].has_link && !reset && fg.have_prev_link;
         // The scene's per-object motion vectors (mvec.c: everything that moves, jitter taken out) when they were made
@@ -11009,7 +11027,8 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
         if (objv) mv = mvec_vectors_img, ok = true;
         else ok = cam_motion(cb, m, fg.prev_vp, link ? fg.cand[best].link : NULL, fg.prev_link, db, mv);
         if (ok) {
-            TexBackend *hl = fg_image(0, b->width, b->height, srgb_of(unorm_of(b->format)), VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            VkFormat format = unorm_of(b->format);
+            TexBackend *hl = fg_image(FG_HUDLESS, b->width, b->height, srgb_of(format), VK_IMAGE_USAGE_TRANSFER_DST_BIT);
             {   // (testing) SAVAGEWIND_FG_INPUTS_AT=<n>: the n-th generated frame's HUD-less image and motion vectors
                 static long at = -1;
                 if (at < 0) at = getenv("SAVAGEWIND_FG_INPUTS_AT") ? atol(getenv("SAVAGEWIND_FG_INPUTS_AT")) : 0;
@@ -11021,17 +11040,29 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
                     cb = vk_cmd();
                 }
             }
-            TexBackend *o = fg_image(2, b->width, b->height, unorm_of(b->format), VK_IMAGE_USAGE_STORAGE_BIT);
-            FgConfig cfg = {b->width, b->height, db->width, db->height, unorm_of(b->format), unorm_of(hl->format), false};
             static int dbg = -1;
             if (dbg < 0) dbg = getenv("SAVAGEWIND_FG_DEBUG_VIEW") != NULL;
-            FgFrame f = {.color = {b->image, unorm_of(b->format), b->width, b->height},
-                         .hudless = {hl->image, unorm_of(hl->format), hl->width, hl->height},
+            static int test = -1;  // (measuring) SAVAGEWIND_FG_TEST=2: no interpolation (the HUD-less copy shown instead)
+            if (test < 0) test = getenv("SAVAGEWIND_FG_TEST") ? atoi(getenv("SAVAGEWIND_FG_TEST")) : 0;
+            bool reduced = test != 2 && !dbg && fg_scene_resolution(db, b);
+            TexBackend *input = b;
+            if (reduced) {
+                // Use the already composited scene so the result agrees with the active upscaler and colour grading.
+                input = fg_image(FG_SCALED_SCENE, db->width, db->height, hl->format, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                vk_full_barrier(cb);
+                gp_mark(cb, "frame generation: downsample scene");
+                fg_blit(cb, hl, input, VK_FILTER_LINEAR);
+            }
+            TexBackend *o = fg_image(FG_INTERPOLATED, input->width, input->height, format, VK_IMAGE_USAGE_STORAGE_BIT);
+            FgConfig cfg = {.display_w = input->width, .display_h = input->height, .render_w = db->width, .render_h = db->height,
+                            .color_format = format, .hudless_format = unorm_of(hl->format)};
+            FgFrame f = {.color = {input->image, format, input->width, input->height},
                          .depth = {db->image, db->format, db->width, db->height},
                          .motion = {mv->image, mv->format, mv->width, mv->height},
                          .out = {o->image, o->format, o->width, o->height},
                          .near_ = m[56], .far_ = m[57], .fovy = 2 * atanf(1 / m[33]), .frame_ms = frame_ms,
                          .frame_id = ++fg.frame_id, .reset = reset, .debug_view = dbg};
+            if (!reduced) f.hudless = (FgImage){hl->image, cfg.hudless_format, hl->width, hl->height};
             if (objv) f.motion_scale[0] = -0.5f * (float)db->width, f.motion_scale[1] = 0.5f * (float)db->height;
             {
                 static int lo = -1;
@@ -11043,8 +11074,6 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
             if (!g_fg_vk.dev) g_fg_vk = (FgVk){g_vk.phys, g_vk.dev, vk_wait_idle_for_contexts};
             vk_full_barrier(cb);
             gp_mark(cb, "frame generation: FSR 3 optical flow + interpolation");
-            static int test = -1;  // (measuring) SAVAGEWIND_FG_TEST=2: no interpolation (the HUD-less copy shown instead)
-            if (test < 0) test = getenv("SAVAGEWIND_FG_TEST") ? atoi(getenv("SAVAGEWIND_FG_TEST")) : 0;
             if (test == 2) {
                 o = hl;
                 ok = true;
@@ -11059,6 +11088,13 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
                 *j = (FgJob){cb, cfg, f};
                 rec_custom(fg_run, j);
                 ok = true;
+            }
+            if (reduced && ok) {
+                TexBackend *composite = fg_image(FG_COMPOSITED, b->width, b->height, format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+                VkImageView views[] = {raw_view(o), raw_view(hl), raw_view(b)};
+                float pc[8] = {1.0f / b->width, 1.0f / b->height};
+                post_pass(cb, "fg_composite.frag", views, 3, composite, pc, false);
+                o = composite;
             }
             vk_full_barrier(cb);
             gp_mark(cb, "frame generation: done");

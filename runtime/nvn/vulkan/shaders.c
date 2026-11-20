@@ -1546,6 +1546,31 @@ static const char *builtin_src(const char *name, int *stage) {
                "  if (pc.b.w > 1.5) o = vec2(inbox ? 1.0 : 0.0, inbox && z >= pc.lk.x && z <= pc.lk.y ? 1.0 : 0.0);  // (debug)\n"
                "}\n";
     }
+    // Restore the game's output-resolution HUD using the SDK's static-content estimate, after upscaling the scene.
+    if (!strcmp(name, "fg_composite.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D generatedScene;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D realScene;\n"
+               "layout(set = 0, binding = 2) uniform sampler2D realFrame;\n"
+               "layout(push_constant) uniform P { vec2 invOutputSize; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 srgbToLinear(vec3 c) {\n"
+               "  return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));\n"
+               "}\n"
+               "void main() {\n"
+               "  ivec2 pixel = ivec2(gl_FragCoord.xy);\n"
+               "  vec3 scene = texelFetch(realScene, pixel, 0).rgb;\n"
+               "  vec3 real = texelFetch(realFrame, pixel, 0).rgb;\n"
+               "  vec3 color = texture(generatedScene, gl_FragCoord.xy * pc.invOutputSize).rgb;\n"
+               "  if (any(notEqual(scene, real))) {\n"
+               "    vec3 a = srgbToLinear(scene), b = srgbToLinear(real);\n"
+               "    vec3 weight = abs(a - b) / max(max(a, b), vec3(1e-6));\n"
+               "    color = mix(color, real, min(1.0, 10.0 * max(weight.r, max(weight.g, weight.b))));\n"
+               "  }\n"
+               "  o = vec4(color, 1.0);\n"
+               "}\n";
+    }
     if (!strcmp(name, "clear.vert")) {
         *stage = STAGE_VERTEX;
         return "#version 450\n"

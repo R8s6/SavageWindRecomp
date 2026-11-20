@@ -1965,6 +1965,11 @@ debug view (motion vector fields, optical flow, disocclusion) instead of the gen
 why frames aren't generated; the `[fg]` lines count generated and presented frames every 2 s. `SAVAGEWIND_EXIT_AT=<frame>`
 ends a scripted run.
 
+`SAVAGEWIND_FG_SCENE_RES=1` uses the scene's render size for optical flow and interpolation when the scene is smaller
+than the 8-bit final image. It upscales the generated scene and restores the HUD at output resolution using the real
+frame and the HUD-less copy. Use `=0` to compare with output-size interpolation. The `[fg] FSR 3 frame interpolation`
+line reports the size FidelityFX uses.
+
 **Measured** (2026-10-25, RTX 3060, Ryzen 5 5600X, hidden 2560x1440 window, HDR10 on, SMAA, no upscaler, VSync
 Off; the Great Plateau by the Temple of Time's walls, standing, then turning the camera; each line the mean over 2 s,
 from the runtime's `[vk]` and `[fg]` lines):

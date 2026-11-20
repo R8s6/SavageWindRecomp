@@ -189,13 +189,20 @@ static FfxResource image(const FgImage *im, const wchar_t *name, bool write) {
 
 static FfxResource shared(int i) { return g.shared.fpGetResource(&g.shared, g.res[i]); }
 
+static bool same_config(const FgConfig &a, const FgConfig &b) {
+    return a.display_w == b.display_w && a.display_h == b.display_h && a.render_w == b.render_w &&
+           a.render_h == b.render_h && a.color_format == b.color_format && a.hudless_format == b.hudless_format &&
+           a.depth_inverted == b.depth_inverted;
+}
+
 extern "C" bool vk_api12(void);  // (device.c)
 extern "C" bool fg_dispatch(VkCommandBuffer cb, const FgConfig *c, const FgFrame *f) {
     if (vk_api12()) return false;  // (a Vulkan 1.2 driver: no frame generation)
-    if (g.live && memcmp(&g.cfg, c, sizeof *c)) {
+    if (g.live && !same_config(g.cfg, *c)) {
         g_fg_vk.wait_idle();
         fg_destroy();
     }
+    const bool reset = f->reset || !g.live;
     if (!g.live && !create(c)) {
         fg_destroy();
         return false;
@@ -224,11 +231,12 @@ extern "C" bool fg_dispatch(VkCommandBuffer cb, const FgConfig *c, const FgFrame
     memcpy(pd.cameraForward, f->cam_fwd, sizeof pd.cameraForward);
     TRY(ffxFrameInterpolationPrepare(&g.fi, &pd));
 
-    FfxResource hudless = image(&f->hudless, L"FG_HudlessColor", false);
+    FfxResource color = image(&f->color, L"FG_Color", false);
+    FfxResource hudless = f->hudless.image ? image(&f->hudless, L"FG_HudlessColor", false) : FfxResource{};
     FfxOpticalflowDispatchDescription od = {};
     od.commandList = cl;
-    od.color = hudless;
-    od.reset = f->reset;
+    od.color = f->hudless.image ? hudless : color;
+    od.reset = reset;
     od.backbufferTransferFunction = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
     od.opticalFlowVector = shared(R_OF_VECTOR);
     od.opticalFlowSCD = shared(R_OF_SCD);
@@ -239,7 +247,7 @@ extern "C" bool fg_dispatch(VkCommandBuffer cb, const FgConfig *c, const FgFrame
     dd.commandList = cl;
     dd.displaySize = {c->display_w, c->display_h};
     dd.renderSize = {c->render_w, c->render_h};
-    dd.currentBackBuffer = image(&f->color, L"FG_Color", false);
+    dd.currentBackBuffer = color;
     dd.currentBackBuffer_HUDLess = hudless;
     dd.output = image(&f->out, L"FG_Output", true);
     dd.interpolationRect = {0, 0, (int)c->display_w, (int)c->display_h};
@@ -253,7 +261,7 @@ extern "C" bool fg_dispatch(VkCommandBuffer cb, const FgConfig *c, const FgFrame
     dd.cameraFovAngleVertical = f->fovy;
     dd.viewSpaceToMetersFactor = 1;
     dd.frameTimeDelta = f->frame_ms;
-    dd.reset = f->reset;
+    dd.reset = reset;
     dd.backBufferTransferFunction = FFX_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
     dd.minMaxLuminance[0] = 0;
     dd.minMaxLuminance[1] = 1;
