@@ -1909,6 +1909,9 @@ static void hdr_make_images(uint32_t n, VkExtent2D ext) {
     hdr_count = hdr_game_count = n;
 }
 
+enum { PRES_Q = 4 };
+static bool fg_pair_queue;  // paired submission is enabled for this swapchain
+
 static void create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps));
@@ -1934,7 +1937,9 @@ static void create_swapchain(void) {
     hdr_failed = hdr && !hdr_found;
     if (hdr && !hdr_found) LOG("[vk] HDR wanted, but this display offers no HDR10 swapchain format: SDR\n");
     if (hdr_found) draw.format = VK_FORMAT_B8G8R8A8_UNORM;
-    uint32_t count = caps.minImageCount + 2;  // (+1, and one for frame generation's queued pair: present_wait_room)
+    const char *pair = getenv("SAVAGEWIND_VK_FG_PAIR");
+    bool try_pair = !hdr_found && pair && !strcmp(pair, "1");
+    uint32_t count = caps.minImageCount + (try_pair ? PRES_Q - 1 : PRES_Q - 2);
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
     VkSwapchainKHR old = g_vk.swapchain;
@@ -1968,6 +1973,10 @@ static void create_swapchain(void) {
     g_vk.sc_mode = wanted_present_mode();  // (what was asked: a change of Video > VSync makes it again)
     g_vk.sc_count = 8;
     vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
+    // At the last acquire, up to PRES_Q - 1 images may still be held by the app. Keep the surface minimum in reserve.
+    fg_pair_queue = try_pair && g_vk.sc_count >= caps.minImageCount + PRES_Q - 1;
+    if (try_pair) LOG("[vk] frame generation pair queue %s (%u swapchain images, %u surface minimum)\n",
+                      fg_pair_queue ? "enabled" : "unavailable", g_vk.sc_count, caps.minImageCount);
     g_hdr = hdr_found;
     if (g_hdr) hdr_make_images(g_vk.sc_count, ext), hdr_metadata_send(g_vk.swapchain);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
@@ -2175,7 +2184,6 @@ pthread_mutex_t g_vk_queue_lock = PTHREAD_MUTEX_INITIALIZER;  // (vk.h)
 static pthread_mutex_t pres_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pres_cv = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t sc_lock = PTHREAD_MUTEX_INITIALIZER;
-enum { PRES_Q = 4 };
 static struct { VkSwapchainKHR sc; VkSemaphore sem; uint32_t img; int kind; uint64_t seq; } presq[PRES_Q];
 static int presq_head, presq_n;  // (pres_m) queued or being presented
 static _Atomic int pres_stale;   // that present said the swapchain is out of date or suboptimal
@@ -2285,14 +2293,22 @@ void vk_present_idle(void) {
     pthread_mutex_unlock(&pres_m);
 }
 
-// Before the next window image is drawn: no plain present waiting (one frame at a time, as before), at most two of
-// frame generation's (the previous pair's game frame, this pair's generated one)
-static void present_wait_room(void) {
+static bool present_queued(void) {
+    pthread_mutex_lock(&pres_m);
+    bool queued = presq_n != 0;
+    pthread_mutex_unlock(&pres_m);
+    return queued;
+}
+
+// Leave two queue entries free at the start of a pair. The GPU lock keeps other producers out between the two
+// images, so the game's image can use the last entry if the swapchain has room for it.
+static void present_wait_room(bool pair_tail) {
+    int limit = pair_tail && fg_pair_queue ? PRES_Q - 1 : PRES_Q - 2;
     pthread_mutex_lock(&pres_m);
     for (;;) {
         bool plain = false;
         for (int i = 0; i < presq_n; i++) plain |= presq[(presq_head + i) % PRES_Q].kind == PRES_PLAIN;
-        if (!plain && presq_n <= 2) break;
+        if (!plain && presq_n <= limit) break;
         pthread_cond_wait(&pres_cv, &pres_m);
     }
     pthread_mutex_unlock(&pres_m);
@@ -2321,7 +2337,7 @@ static bool acquire_test_timeout(void) {
 
 static bool present_on_recorder(void);
 static VkResult acquire_image(VkSemaphore sem, uint32_t *img) {
-    bool threaded = present_threaded() || present_on_recorder();  // (another thread presents: sc_lock, short waits)
+    bool threaded = present_threaded() || present_on_recorder() || present_queued();
     uint64_t t0 = SDL_GetTicksNS();
     for (;;) {  // (threaded: a short timeout at a time, not holding the swapchain while the present thread needs it)
         uint64_t tc = SDL_GetTicksNS();
@@ -2374,13 +2390,7 @@ static bool present_on_recorder(void) {
 // Present window image img once sem is signalled (kind, seq: frame generation's pair and the frame's submission, see
 // present_wait_turn). Returns false when the swapchain must be made again.
 static bool present_image(uint32_t img, VkSemaphore sem, int kind, uint64_t seq) {
-    bool threaded = present_threaded();
-    if (!threaded) {
-        pthread_mutex_lock(&pres_m);
-        bool queued = presq_n != 0;
-        pthread_mutex_unlock(&pres_m);
-        threaded = (kind != PRES_PLAIN || queued) && fg_pacer();
-    }
+    bool threaded = present_threaded() || ((kind != PRES_PLAIN || present_queued()) && fg_pacer());
     if (!threaded && kind == PRES_PLAIN && present_on_recorder()) {
         __typeof__(recp[0]) *q = &recp[recp_n++ % RECP_N];
         *q = (__typeof__(recp[0])){g_vk.swapchain, sem, img};
@@ -2686,7 +2696,7 @@ bool vk_frame_hdr(void) { return cur_frame.hdr_game; }
 
 // Acquire the next window image and begin rendering into it (cleared to `clear`). hdr_game: the caller has the game's
 // float picture (hdr.c) and draws it into RGBA16F. Returns false when there is nothing to draw into (minimised window).
-static bool frame_begin(const float clear[4], bool hdr_game) {
+static bool frame_begin(const float clear[4], bool hdr_game, bool pair_tail) {
     cur_frame.ok = false;
     cur_frame.hdr_game = false;
     cur_frame.menu = false;
@@ -2701,7 +2711,7 @@ static bool frame_begin(const float clear[4], bool hdr_game) {
     }
     if (!w || !h || (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) || covered) return false;
     uint64_t tp = SDL_GetTicksNS();
-    { SW_ZONE("present/wait_room"); present_wait_room(); }
+    { SW_ZONE("present/wait_room"); present_wait_room(pair_tail); }
     g_present_split[4] += SDL_GetTicksNS() - tp;
     float white;  // (Windows HDR turned on or off, the window moved to another display, Video > HDR changed)
     bool hdr = hdr_wanted(&white);
@@ -2766,7 +2776,7 @@ static bool frame_begin(const float clear[4], bool hdr_game) {
     return true;
 }
 
-bool vk_frame_begin(const float clear[4]) { return frame_begin(clear, false); }
+bool vk_frame_begin(const float clear[4]) { return frame_begin(clear, false, false); }
 
 // Passes of their own between vk_frame_begin and vk_frame_end (exec.c post passes): end the window image's
 // rendering, and begin it again keeping what was drawn.
@@ -3215,7 +3225,7 @@ static void present_locked(NvnTexture *t) {
     g_fg_active = gen != NULL;
     static const float black[4] = {0, 0, 0, 1};
     bool have;
-    { SW_ZONE("present/frame_begin"); have = frame_begin(black, hdr_src); }
+    { SW_ZONE("present/frame_begin"); have = frame_begin(black, hdr_src, false); }
     if (hdr_src && !vk_frame_hdr()) {  // (HDR was turned off while the swapchain was remade)
         hdr_src = false;
         src = b;
@@ -3282,10 +3292,10 @@ static void present_locked(NvnTexture *t) {
             }
             frame_kind = PRES_GEN;
             vk_frame_end(gpath[0] ? gpath : NULL);
-            frame_kind = PRES_AFTER_GEN;  // (the game's frame, below)
             gen_frames++;
             perfmon_generated_frame();
-            if (!vk_frame_begin(black)) { renderer_submit(); goto presented; }
+            if (!frame_begin(black, false, true)) { renderer_submit(); goto presented; }
+            frame_kind = PRES_AFTER_GEN;  // (the game's frame, below)
             cb = vk_cmd();
         }
         { SW_ZONE("present/draw"); vk_present_draw(cb, src, (float)vx, (float)vy, (float)vw, (float)vh, pv); }
