@@ -1546,6 +1546,25 @@ static const char *builtin_src(const char *name, int *stage) {
                "  if (pc.b.w > 1.5) o = vec2(inbox ? 1.0 : 0.0, inbox && z >= pc.lk.x && z <= pc.lk.y ? 1.0 : 0.0);  // (debug)\n"
                "}\n";
     }
+    // Sample depth and motion from the same source pixel to keep vectors attached to the selected surface.
+    if (!strcmp(name, "fg_resample.comp")) {
+        *stage = STAGE_COMPUTE;
+        return "#version 450\n"
+               "layout(local_size_x = 8, local_size_y = 8) in;\n"
+               "layout(set = 0, binding = 0) uniform sampler2D depthIn;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D motionIn;\n"
+               "layout(set = 0, binding = 8, r32f) writeonly uniform image2D depthOut;\n"
+               "layout(set = 0, binding = 9, rgba16f) writeonly uniform image2D motionOut;\n"
+               "void main() {\n"
+               "  ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);\n"
+               "  ivec2 size = imageSize(depthOut);\n"
+               "  if (any(greaterThanEqual(pixel, size))) return;\n"
+               "  vec2 uv = (vec2(pixel) + 0.5) / vec2(size);\n"
+               "  ivec2 src = ivec2(uv * vec2(textureSize(depthIn, 0)));\n"
+               "  imageStore(depthOut, pixel, vec4(texelFetch(depthIn, src, 0).r));\n"
+               "  imageStore(motionOut, pixel, vec4(texelFetch(motionIn, src, 0).xy, 0.0, 0.0));\n"
+               "}\n";
+    }
     // Restore the game's output-resolution HUD using the SDK's static-content estimate, after upscaling the scene.
     if (!strcmp(name, "fg_composite.frag")) {
         *stage = STAGE_FRAGMENT;

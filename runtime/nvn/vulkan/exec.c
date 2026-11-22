@@ -10740,7 +10740,8 @@ static struct {
     uint64_t frame_id, last_ns;
 } fg;
 
-enum { FG_HUDLESS, FG_MOTION, FG_INTERPOLATED, FG_SCALED_SCENE, FG_COMPOSITED, FG_IMAGES };
+enum { FG_HUDLESS, FG_MOTION, FG_INTERPOLATED, FG_SCALED_SCENE, FG_COMPOSITED, FG_SCALED_DEPTH, FG_SCALED_MOTION,
+       FG_IMAGES };
 
 static TexBackend *fg_image(int i, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage) {
     static TexBackend img[FG_IMAGES];
@@ -10958,17 +10959,44 @@ static void fg_run(void *arg) {
     if (!fg_dispatch(j->cb, &j->cfg, &j->f)) atomic_store(&fg_failed, 1);
 }
 
-static bool fg_scene_resolution(const TexBackend *depth, const TexBackend *color) {
-    static int enabled = -1;
-    if (enabled < 0) {
+static VkExtent2D fg_interpolation_extent(const TexBackend *depth, const TexBackend *color) {
+    static int scene_res = -1, percent = 100;
+    if (scene_res < 0) {
         const char *e = getenv("SAVAGEWIND_FG_SCENE_RES");
-        enabled = e && atoi(e) != 0;
+        scene_res = e && atoi(e) != 0;
+        e = getenv("SAVAGEWIND_FG_SCALE");
+        if (e) {
+            char *end;
+            long value = strtol(e, &end, 10);
+            if (!*end && value > 0 && value < 100) percent = (int)value;
+        }
     }
-    // Optical flow needs six levels of downsampled luma. The HUD pass compares 8-bit sRGB colour.
+    VkExtent2D full = {color->width, color->height};
     VkFormat format = unorm_of(color->format);
-    return enabled && (format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM) &&
-           depth->width >= 64 && depth->height >= 64 && depth->width <= color->width && depth->height <= color->height &&
-           (depth->width < color->width || depth->height < color->height);
+    // The HUD pass compares 8-bit sRGB colour. Optical flow needs six levels of downsampled luma.
+    if (format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_B8G8R8A8_UNORM) return full;
+    if (percent < 100) {
+        double fit = fmin(1.0, fmin((double)full.width / depth->width, (double)full.height / depth->height));
+        double scale = fit * percent / 100.0;
+        VkExtent2D size = {(uint32_t)(depth->width * scale), (uint32_t)(depth->height * scale)};
+        if (size.width >= 64 && size.height >= 64) return size;
+    }
+    if (scene_res && depth->width >= 64 && depth->height >= 64 && depth->width <= full.width && depth->height <= full.height)
+        return (VkExtent2D){depth->width, depth->height};
+    return full;
+}
+
+static void fg_resample_inputs(VkCommandBuffer cb, VkExtent2D size, TexBackend **depth, TexBackend **motion) {
+    TexBackend *d = *depth;
+    static const VkComponentMapping id = {0};
+    VkImageView src[] = {vk_image_view(d, VK_IMAGE_VIEW_TYPE_2D, d->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT),
+                         post_view(*motion)};
+    TexBackend *dst[] = {fg_image(FG_SCALED_DEPTH, size.width, size.height, VK_FORMAT_R32_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT),
+                         fg_image(FG_SCALED_MOTION, size.width, size.height, VK_FORMAT_R16G16B16A16_SFLOAT, VK_IMAGE_USAGE_STORAGE_BIT)};
+    const float pc[16] = {0};
+    cpost_pass(cb, "fg_resample.comp", src, 2, dst, 2, pc, size.width, size.height);
+    *depth = dst[0];
+    *motion = dst[1];
 }
 
 // At the game's present (device.c), outside the window image's rendering: the frame between the previous one and
@@ -11044,26 +11072,28 @@ TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
             if (dbg < 0) dbg = getenv("SAVAGEWIND_FG_DEBUG_VIEW") != NULL;
             static int test = -1;  // (measuring) SAVAGEWIND_FG_TEST=2: no interpolation (the HUD-less copy shown instead)
             if (test < 0) test = getenv("SAVAGEWIND_FG_TEST") ? atoi(getenv("SAVAGEWIND_FG_TEST")) : 0;
-            bool reduced = test != 2 && !dbg && fg_scene_resolution(db, b);
-            TexBackend *input = b;
+            VkExtent2D size = test != 2 && !dbg ? fg_interpolation_extent(db, b) : (VkExtent2D){b->width, b->height};
+            bool reduced = size.width != b->width || size.height != b->height;
+            TexBackend *input = b, *depth = db;
             if (reduced) {
                 // Use the already composited scene so the result agrees with the active upscaler and colour grading.
-                input = fg_image(FG_SCALED_SCENE, db->width, db->height, hl->format, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                input = fg_image(FG_SCALED_SCENE, size.width, size.height, hl->format, VK_IMAGE_USAGE_TRANSFER_DST_BIT);
                 vk_full_barrier(cb);
                 gp_mark(cb, "frame generation: downsample scene");
                 fg_blit(cb, hl, input, VK_FILTER_LINEAR);
+                if (size.width != db->width || size.height != db->height) fg_resample_inputs(cb, size, &depth, &mv);
             }
             TexBackend *o = fg_image(FG_INTERPOLATED, input->width, input->height, format, VK_IMAGE_USAGE_STORAGE_BIT);
-            FgConfig cfg = {.display_w = input->width, .display_h = input->height, .render_w = db->width, .render_h = db->height,
+            FgConfig cfg = {.display_w = input->width, .display_h = input->height, .render_w = depth->width, .render_h = depth->height,
                             .color_format = format, .hudless_format = unorm_of(hl->format)};
             FgFrame f = {.color = {input->image, format, input->width, input->height},
-                         .depth = {db->image, db->format, db->width, db->height},
+                         .depth = {depth->image, depth->format, depth->width, depth->height},
                          .motion = {mv->image, mv->format, mv->width, mv->height},
                          .out = {o->image, o->format, o->width, o->height},
                          .near_ = m[56], .far_ = m[57], .fovy = 2 * atanf(1 / m[33]), .frame_ms = frame_ms,
                          .frame_id = ++fg.frame_id, .reset = reset, .debug_view = dbg};
             if (!reduced) f.hudless = (FgImage){hl->image, cfg.hudless_format, hl->width, hl->height};
-            if (objv) f.motion_scale[0] = -0.5f * (float)db->width, f.motion_scale[1] = 0.5f * (float)db->height;
+            if (objv) f.motion_scale[0] = -0.5f * (float)depth->width, f.motion_scale[1] = 0.5f * (float)depth->height;
             {
                 static int lo = -1;
                 if (lo != (int)objv) LOG("[fg] motion vectors: %s\n", objv ? "per object (mvec)" : "camera and Link's box");
