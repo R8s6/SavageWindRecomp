@@ -1975,9 +1975,9 @@ static void create_swapchain(void) {
     vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
     // At the last acquire, up to PRES_Q - 1 images may still be held by the app. Keep the surface minimum in reserve.
     fg_pair_queue = try_pair && g_vk.sc_count >= caps.minImageCount + PRES_Q - 1;
-    if (try_pair) LOG("[vk] frame generation pair queue %s (%u swapchain images, %u surface minimum, %d acquire slots)\n",
+    if (try_pair) LOG("[vk] frame generation pair queue %s (%u swapchain images, %u surface minimum, %d acquire slots%s)\n",
                       fg_pair_queue ? "enabled" : "unavailable", g_vk.sc_count, caps.minImageCount,
-                      fg_pair_queue ? PRES_Q : ACQUIRE_SLOTS);
+                      fg_pair_queue ? PRES_Q : ACQUIRE_SLOTS, fg_pair_queue ? ", early FG submit" : "");
     g_hdr = hdr_found;
     if (g_hdr) hdr_make_images(g_vk.sc_count, ext), hdr_metadata_send(g_vk.swapchain);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
@@ -2203,7 +2203,7 @@ static void present_wait_turn(int kind, uint64_t seq) {
     if (kind == PRES_PLAIN) return;
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
-    vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull);  // (drawn; a second at most)
+    { SW_ZONE("present/wait_drawn"); vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull); }
     uint64_t now = SDL_GetTicksNS();
     if (kind == PRES_GEN) {
         double dt = last_gen ? (double)(now - last_gen) : 0;
@@ -2212,7 +2212,10 @@ static void present_wait_turn(int kind, uint64_t seq) {
         return;
     }
     uint64_t at = last_gen + (uint64_t)(gen_iv / 2);
-    if (gen_iv > 0 && now < at) SDL_DelayPrecise(at - now);
+    if (gen_iv > 0 && now < at) {
+        SW_ZONE("present/pace_pair");
+        SDL_DelayPrecise(at - now);
+    }
 }
 
 static void *present_thread(void *arg) {
@@ -2240,7 +2243,8 @@ static void *present_thread(void *arg) {
         pthread_mutex_lock(&sc_lock);
         uint64_t tq = SDL_GetTicksNS();
         pthread_mutex_lock(&g_vk_queue_lock);  // (one queue: the recorder submits on it meanwhile)
-        VkResult r = queue_present(g_vk.present_queue, &pi);
+        VkResult r;
+        { SW_ZONE("present/driver"); r = queue_present(g_vk.present_queue, &pi); }
         pthread_mutex_unlock(&g_vk_queue_lock);
         tq = SDL_GetTicksNS() - tq;
         pthread_mutex_unlock(&sc_lock);
@@ -3225,6 +3229,12 @@ static void present_locked(NvnTexture *t) {
         if (test == 1) gen = NULL;
     }
     g_fg_active = gen != NULL;
+    if (gen && fg_pair_queue) {
+        // The offscreen passes can run while frame_begin waits for room and a swapchain image. The window draw
+        // samples their result on the same queue after frame_begin's barrier.
+        SW_ZONE("present/submit_fg");
+        vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
+    }
     static const float black[4] = {0, 0, 0, 1};
     bool have;
     { SW_ZONE("present/frame_begin"); have = frame_begin(black, hdr_src, false); }
