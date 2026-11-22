@@ -1971,8 +1971,9 @@ frame and the HUD-less copy. Use `=0` to compare with output-size interpolation.
 line reports the size FidelityFX uses.
 
 `SAVAGEWIND_VK_FG_PAIR=1` reserves room in the present queue for both the generated and game images before queuing
-either one. It requests one more SDR swapchain image and uses the usual per-image queue limit when the surface has
-too few images. The `[vk] frame generation pair queue` line reports whether the swapchain supports it.
+either one. It requests one more SDR swapchain image and uses an acquire semaphore slot for each queue entry. It
+uses the usual per-image queue limit and three acquire slots when the surface has too few images. The `[vk] frame
+generation pair queue` line reports whether the swapchain supports it and how many slots are in use.
 
 **Measured** (2026-10-25, RTX 3060, Ryzen 5 5600X, hidden 2560x1440 window, HDR10 on, SMAA, no upscaler, VSync
 Off; the Great Plateau by the Temple of Time's walls, standing, then turning the camera; each line the mean over 2 s,

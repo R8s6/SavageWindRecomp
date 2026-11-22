@@ -1909,7 +1909,7 @@ static void hdr_make_images(uint32_t n, VkExtent2D ext) {
     hdr_count = hdr_game_count = n;
 }
 
-enum { PRES_Q = 4 };
+enum { PRES_Q = 4, ACQUIRE_SLOTS = 3 };
 static bool fg_pair_queue;  // paired submission is enabled for this swapchain
 
 static void create_swapchain(void) {
@@ -1975,8 +1975,9 @@ static void create_swapchain(void) {
     vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
     // At the last acquire, up to PRES_Q - 1 images may still be held by the app. Keep the surface minimum in reserve.
     fg_pair_queue = try_pair && g_vk.sc_count >= caps.minImageCount + PRES_Q - 1;
-    if (try_pair) LOG("[vk] frame generation pair queue %s (%u swapchain images, %u surface minimum)\n",
-                      fg_pair_queue ? "enabled" : "unavailable", g_vk.sc_count, caps.minImageCount);
+    if (try_pair) LOG("[vk] frame generation pair queue %s (%u swapchain images, %u surface minimum, %d acquire slots)\n",
+                      fg_pair_queue ? "enabled" : "unavailable", g_vk.sc_count, caps.minImageCount,
+                      fg_pair_queue ? PRES_Q : ACQUIRE_SLOTS);
     g_hdr = hdr_found;
     if (g_hdr) hdr_make_images(g_vk.sc_count, ext), hdr_metadata_send(g_vk.swapchain);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
@@ -2418,9 +2419,8 @@ static bool present_image(uint32_t img, VkSemaphore sem, int kind, uint64_t seq)
 
 // ================================================================== frames (start screen and game)
 // Acquire semaphores rotate per frame in flight; a slot is reused once the submission that waited on it is done.
-#define FRAMES 3
-static VkSemaphore acquire_sem[FRAMES], done_sem[8];
-static uint64_t slot_seq[FRAMES];
+static VkSemaphore acquire_sem[PRES_Q], done_sem[8];
+static uint64_t slot_seq[PRES_Q];
 static int slot;
 
 static VkSemaphore binary_semaphore(void) {
@@ -2723,7 +2723,9 @@ static bool frame_begin(const float clear[4], bool hdr_game, bool pair_tail) {
     static int trace = -1;
     if (trace < 0) trace = getenv("SAVAGEWIND_VK_TRACE") != NULL;
     if (trace) LOG("[vk] frame begin %dx%d (swapchain %ux%u)\n", w, h, g_vk.sc_extent.width, g_vk.sc_extent.height);
-    slot = (slot + 1) % FRAMES;
+    // A pair can fill all four entries in presq. With three slots its real image can wait on the previous pair's
+    // generated image before it has a semaphore of its own.
+    slot = (slot + 1) % (fg_pair_queue ? PRES_Q : ACQUIRE_SLOTS);
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
     uint64_t tw = SDL_GetTicksNS();
     { SW_ZONE("present/slot_wait"); vk_wait_seq(slot_seq[slot]); }
@@ -2753,7 +2755,6 @@ static bool frame_begin(const float clear[4], bool hdr_game, bool pair_tail) {
     }
     cur_frame.acquired = acquire_sem[slot];
     cur_frame.hdr_game = hdr_game && g_hdr && cur_frame.image < hdr_game_count;
-    slot_seq[slot] = vk_pending_seq();
     VkCommandBuffer cb = vk_cmd();
     // The window pass reads the game's image, written by an earlier submission's passes: only the full barrier that
     // ends an upload command buffer made those writes visible, when this submission had uploads (validation:
@@ -2871,6 +2872,7 @@ void vk_frame_end(const char *shot_path) {
     uint32_t img = cur_frame.image;
     if (!done_sem[img]) done_sem[img] = binary_semaphore();
     uint64_t seq = vk_pending_seq();
+    slot_seq[slot] = seq;
     uint64_t ts = SDL_GetTicksNS();
     { SW_ZONE("present/submit"); vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE); }
     g_present_split[3] += SDL_GetTicksNS() - ts;
