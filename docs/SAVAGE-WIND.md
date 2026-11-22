@@ -1970,12 +1970,6 @@ than the 8-bit final image. It upscales the generated scene and restores the HUD
 frame and the HUD-less copy. Use `=0` to compare with output-size interpolation. The `[fg] FSR 3 frame interpolation`
 line reports the size FidelityFX uses.
 
-`SAVAGEWIND_FG_SCALE=75` runs frame generation at 75 percent of the scene's width and height. The scene is fitted
-inside the final image before applying the scale. Colour, depth and motion vectors are resampled to that size, then
-the generated scene is upscaled and the HUD is restored at output resolution. Lower scales reduce the interpolation
-work and can soften the generated scene. Values from 1 to 99 enable scaling when both dimensions are at least 64
-pixels. Unset the variable to use the usual interpolation size.
-
 `SAVAGEWIND_VK_FG_PAIR=1` reserves room in the present queue for both the generated and game images before queuing
 either one. It requests one more SDR swapchain image and uses an acquire semaphore slot for each queue entry.
 Offscreen interpolation is submitted before acquiring the first window image so it can run during the queue wait.
